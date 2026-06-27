@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "guildlm-crucible"
+version = "0.1.0"
+description = "GuildLM Crucible — a pluggable evaluation framework for specialist LLMs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "GuildLM" }]
+keywords = ["llm", "evaluation", "benchmark", "guildlm", "crucible"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "typer>=0.9",
+    "pyyaml>=6.0",
+    "openai>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+crucible = "src.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/guildlm/guildlm.github.io"
+
+[tool.setuptools]
+packages = ["src", "src.core", "src.evaluators"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

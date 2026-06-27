@@ -1,0 +1,12 @@
+name: go_basic
+description: >
+  Basic Go functional evaluation. Each sample ships canonical Go source as its
+  prediction plus a Go test in metadata; the go_functional evaluator vets,
+  builds and tests it in a sandbox. Requires Docker to actually execute.
+evaluators:
+  - go_functional
+dataset: data/go_basic.jsonl
+config:
+  go_functional:
+    timeout: 30.0
+    run_vet: true

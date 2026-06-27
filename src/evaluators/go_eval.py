@@ -1,95 +1,114 @@
-import os
-import tempfile
-import subprocess
+"""Go functional evaluator.
+
+Compiles and tests model-generated Go code inside a sandbox. The actual code
+execution is delegated to a :class:`~src.core.sandbox.Sandbox`, so the Docker
+dependency is fully mockable and the evaluator degrades gracefully when no
+sandbox is available.
+
+Sample contract:
+    * ``sample.prediction`` — the Go source under test (package ``sandbox``).
+    * ``sample.metadata["tests"]`` — Go test source (``*_test.go`` content).
+    * ``sample.metadata["module"]`` — optional module name (default ``sandbox``).
+"""
+
+from __future__ import annotations
+
 import logging
-from typing import Dict, Any
+
+from src.core.registry import Evaluator, register
+from src.core.sandbox import DockerSandbox, Sandbox
+from src.core.types import EvalResult, EvalSample
 
 logger = logging.getLogger(__name__)
 
-class GoEvaluator:
-    """
-    Evaluates generated Go code by compiling and running unit tests against it.
-    """
-    
-    def run(self, generated_code: str, expected_tests: str) -> Dict[str, Any]:
-        """
-        Runs `go test` on the generated code.
-        """
-        # Create a temporary sandbox
-        with tempfile.TemporaryDirectory() as temp_dir:
-            main_file = os.path.join(temp_dir, "main.go")
-            test_file = os.path.join(temp_dir, "main_test.go")
-            
-            # Write files
-            with open(main_file, "w") as f:
-                f.write(generated_code)
-                
-            with open(test_file, "w") as f:
-                f.write(expected_tests)
-                
-            # Initialize go module
-            try:
-                subprocess.run(
-                    ["go", "mod", "init", "sandbox"],
-                    cwd=temp_dir,
-                    check=True,
-                    capture_output=True
-                )
-            except subprocess.CalledProcessError as e:
-                return {"status": "error", "message": "Failed to init go module", "stderr": e.stderr.decode()}
-                
-            # Run tests
-            try:
-                result = subprocess.run(
-                    ["go", "test", "-v"],
-                    cwd=temp_dir,
-                    capture_output=True,
-                    timeout=10 # Prevent infinite loops
-                )
-                
-                stdout = result.stdout.decode('utf-8', errors='replace')
-                stderr = result.stderr.decode('utf-8', errors='replace')
-                
-                if result.returncode == 0:
-                    return {
-                        "status": "pass",
-                        "output": stdout
-                    }
-                else:
-                    return {
-                        "status": "fail",
-                        "output": stdout,
-                        "stderr": stderr
-                    }
-            except subprocess.TimeoutExpired:
-                return {
-                    "status": "fail",
-                    "message": "Execution timed out (10s)",
-                }
-            except Exception as e:
-                return {
-                    "status": "error",
-                    "message": str(e)
-                }
+__all__ = ["GoFunctionalEvaluator"]
 
-# Example usage
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    
-    evaluator = GoEvaluator()
-    
-    good_code = "package sandbox\n\nfunc Add(a, b int) int { return a + b }"
-    bad_code = "package sandbox\n\nfunc Add(a, b int) int { return a - b }"
-    tests = '''package sandbox
-import "testing"
-func TestAdd(t *testing.T) {
-    if Add(2, 3) != 5 { t.Fatal("Failed") }
-}'''
 
-    logger.info("Testing Good Code:")
-    res_good = evaluator.run(good_code, tests)
-    print(res_good)
-    
-    logger.info("Testing Bad Code:")
-    res_bad = evaluator.run(bad_code, tests)
-    print(res_bad)
+@register("go_functional")
+class GoFunctionalEvaluator(Evaluator):
+    """Evaluate Go code by vetting, building and testing it in a sandbox.
+
+    The pipeline runs ``go vet`` then ``go test`` (which implies a build). A
+    sample passes only when both succeed. ``go vet`` failures are surfaced as a
+    distinct status so static-analysis problems are visible in reports.
+    """
+
+    name = "go_functional"
+
+    def __init__(
+        self,
+        sandbox: Sandbox | None = None,
+        *,
+        module: str = "sandbox",
+        timeout: float = 30.0,
+        run_vet: bool = True,
+    ) -> None:
+        """Args:
+        sandbox: Execution backend. Defaults to a :class:`DockerSandbox`.
+        module: Go module name used in the generated ``go.mod``.
+        timeout: Per-run wall-clock budget passed to the sandbox.
+        run_vet: Whether to run ``go vet`` before the test stage.
+        """
+        self.sandbox = sandbox if sandbox is not None else DockerSandbox()
+        self.module = module
+        self.timeout = timeout
+        self.run_vet = run_vet
+
+    def evaluate(self, sample: EvalSample) -> EvalResult:
+        code = sample.prediction or ""
+        tests = str(sample.metadata.get("tests", ""))
+        module = str(sample.metadata.get("module", self.module))
+
+        if not code.strip():
+            return EvalResult(
+                score=0.0,
+                passed=False,
+                details={"status": "empty_prediction", "message": "No Go code to evaluate."},
+            )
+
+        files = {
+            "go.mod": f"module {module}\n\ngo 1.21\n",
+            "main.go": code,
+        }
+        if tests.strip():
+            files["main_test.go"] = tests
+
+        commands: list[list[str]] = []
+        if self.run_vet:
+            commands.append(["go", "vet", "./..."])
+        if tests.strip():
+            commands.append(["go", "test", "./...", "-run", ".", "-count=1"])
+        else:
+            # No tests provided: a successful build is the strongest signal.
+            commands.append(["go", "build", "./..."])
+
+        logger.info("Running Go sandbox for sample %s", sample.id)
+        result = self.sandbox.run(files, commands, timeout=self.timeout)
+
+        details = {
+            "status": result.status,
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "command": list(result.command),
+        }
+
+        if result.status == "unavailable":
+            return EvalResult(
+                score=0.0,
+                passed=False,
+                details={**details, "message": "Sandbox unavailable (Docker required)."},
+            )
+        if result.status == "timeout":
+            return EvalResult(
+                score=0.0,
+                passed=False,
+                details={**details, "message": f"Execution timed out after {self.timeout}s."},
+            )
+        if result.ok:
+            return EvalResult(score=1.0, passed=True, details=details)
+
+        # Non-zero exit: distinguish vet vs build/test failures for reporting.
+        failing = " ".join(result.command)
+        message = "go vet failed" if "vet" in failing else "build or tests failed"
+        return EvalResult(score=0.0, passed=False, details={**details, "message": message})
